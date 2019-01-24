@@ -30,11 +30,7 @@ func (t *templateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if t.templ == nil {
 		t.templ = template.Must(template.ParseFiles(filepath.Join("templates", t.filename)))
 	}
-
+	// fetch character from context
 	data := map[string]interface{}{}
-	if authCookie, err := r.Cookie("auth"); err == nil {
-		data["ID"] = authCookie.Value
-	}
-
 	t.templ.Execute(w, data)
 }

@@ -1,5 +1,6 @@
 /.vscode
 /tmp
+env.sh
 
 
 # Binaries for programs and plugins

@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	ctx  = context.Background()
-	conf = &oauth2.Config{
+	ctx     = context.Background()
+	eveConf = &oauth2.Config{
 		ClientID:     os.Getenv("EVE_CLIENT_ID"),
 		ClientSecret: os.Getenv("EVE_CLIENT_SECRET"),
 		RedirectURL:  "http://localhost:4000/auth/callback/eve",
@@ -23,6 +23,16 @@ var (
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  "https://login.eveonline.com/oauth/authorize/",
 			TokenURL: "https://login.eveonline.com/oauth/token",
+		},
+	}
+	discordConf = &oauth2.Config{
+		ClientID:     os.Getenv("DISCORD_CLIENT_ID"),
+		ClientSecret: os.Getenv("DISCORD_CLIENT_SECRET"),
+		RedirectURL:  "http://localhost:4000/auth/callback/discord",
+		Scopes:       []string{"identify"},
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://discordapp.com/api/oauth2/authorize",
+			TokenURL: "https://discordapp.com/api/oauth2/token",
 		},
 	}
 )
@@ -54,64 +64,122 @@ func MustAuth(handler http.Handler) http.Handler {
 
 // loginHandler handles the Eve SSO login process
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	if conf.ClientID == "" || conf.ClientSecret == "" {
+	if eveConf.ClientID == "" || eveConf.ClientSecret == "" {
 		log.Fatalln("No clientID or ClientSecret: Did you remember to set environment variables?")
 	}
 
 	segs := strings.Split(r.URL.Path, "/")
 	action := segs[2]
+	service := segs[3]
 
 	switch action {
 
 	case "login":
-		url := conf.AuthCodeURL("state", oauth2.AccessTypeOnline)
-		// Redirect user to consent page to ask for permission for the scopes
-		//specified
+		url, err := authCodeURL(service)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
 		http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 
 	case "callback":
-		r.ParseForm()
-		code := r.FormValue("code")
-		tok, err := conf.Exchange(ctx, code)
-		if err != nil {
-			w.Write([]byte(fmt.Sprintf("error exchanging auth code: %s", err)))
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-		if !tok.Valid() {
-			w.Write([]byte("Invalid token received from provider"))
+		if service == "eve" {
+			r.ParseForm()
+			code := r.FormValue("code")
+			tok, err := eveConf.Exchange(ctx, code)
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error exchanging auth code: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !tok.Valid() {
+				w.Write([]byte("Invalid token received from provider"))
+				return
+			}
+
+			authenticatedClient := eveConf.Client(ctx, tok)
+			resp, err := authenticatedClient.Get("https://login.eveonline.com/oauth/verify")
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error verifying: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			buf, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error reading resp.Body: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			info := CharacterInfo{}
+			if err := json.Unmarshal(buf, &info); err != nil {
+				w.Write([]byte(fmt.Sprintf("error unmarshalling: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			// This is a basic cookie... it is not safe, it is very very bad.
+			http.SetCookie(w, &http.Cookie{
+				Name:  "auth",
+				Value: info.cookieValue(),
+				Path:  "/"})
+
+			// go back to user page
+			http.Redirect(w, r, "/user", http.StatusTemporaryRedirect)
+			return
 		}
 
-		authenticatedClient := conf.Client(ctx, tok)
-		resp, err := authenticatedClient.Get("https://login.eveonline.com/oauth/verify")
-		if err != nil {
-			w.Write([]byte(fmt.Sprintf("error verifying: %s", err)))
-			w.WriteHeader(http.StatusInternalServerError)
+		if service == "discord" {
+			r.ParseForm()
+			code := r.FormValue("code")
+
+			tok, err := discordConf.Exchange(ctx, code)
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error exchanging auth code: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !tok.Valid() {
+				w.Write([]byte("Invalid token received from provider"))
+				return
+			}
+
+			authenticatedClient := discordConf.Client(ctx, tok)
+			resp, err := authenticatedClient.Get("https://discordapp.com/api/v6/users/@me")
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error getting user: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			buf, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				w.Write([]byte(fmt.Sprintf("error reading resp.Body: %s", err)))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			w.Write(buf)
 		}
-
-		buf, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			w.Write([]byte(fmt.Sprintf("error reading resp.Body: %s", err)))
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		info := CharacterInfo{}
-		if err := json.Unmarshal(buf, &info); err != nil {
-			w.Write([]byte(fmt.Sprintf("error unmarshalling: %s", err)))
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// This is a basic cookie... it is not safe, it is very very bad.
-		http.SetCookie(w, &http.Cookie{
-			Name:  "auth",
-			Value: info.cookieValue(),
-			Path:  "/"})
-
-		// go back to user page
-		http.Redirect(w, r, "/user", http.StatusTemporaryRedirect)
 
 	default:
 		w.Write([]byte(fmt.Sprintf("Auth action %s not supported", action)))
 		w.WriteHeader(http.StatusNotFound)
 	}
 
+}
+
+func authCodeURL(service string) (string, error) {
+	switch service {
+	case "eve":
+		url := eveConf.AuthCodeURL("state", oauth2.AccessTypeOffline)
+		return url, nil
+	case "discord":
+		url := discordConf.AuthCodeURL("state", oauth2.AccessTypeOnline)
+		return url, nil
+	default:
+		return "", fmt.Errorf("service %s is not supported", service)
+	}
 }
